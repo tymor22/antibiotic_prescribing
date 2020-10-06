@@ -1,0 +1,881 @@
+---
+title: "antibiotic_prescribing_paper"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+---
+title: "antibiotic_prescribing_crisis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+Load libraries that we will be using
+
+```{r}
+library(tidyverse)
+library(sf)
+library(tidycensus)
+library(readxl)
+library(DescTools)
+library(parsnip)
+library(tidymodels)
+library(randomForest)
+```
+
+
+Load all of the data that we will be using
+
+```{r}
+address_county_mapping_data <- "~/antibiotics_hamamsy/all_address_county_mappings_3_1.R"
+state_data <- "~/antibiotics_hamamsy/50_us_states_all_data.csv"
+medicare_part_d_enrollees_data <- "~/antibiotics_hamamsy/Medicare_Part_D_Enrollees.xlsx"
+provider_info_2017_data <- "~/antibiotics_hamamsy/PartD_Prescriber_PUF_NPI_17.txt"
+drug_categories_data <- "~/antibiotics_hamamsy/PartD_Prescriber_PUF_NPI_16_Drug_Category_Lists.xlsx"
+county_w_medicare_eligible_data <- "~/county_w_medicare_eligible.shp"
+hai_data <- "~/antibiotics_hamamsy/Healthcare_Associated_Infections_-_Hospital (1).csv"
+public_health_data <- "~/antibiotics_hamamsy/public_health_covariates.csv"
+
+#medicare enrolees
+medicare_part_d <- 
+  read_xlsx(medicare_part_d_enrollees_data, sheet = 1) %>% 
+  mutate_at(vars(`2014`:`2017`), as.integer) 
+
+#antibiotic list
+antibiotics <- 
+  read_xlsx(drug_categories_data, sheet = 4, skip = 2) %>% 
+  select(`Drug Name`, `Generic Name`)
+
+#county mappings
+address_county_mapping <- 
+  read_csv(address_county_mapping_data) %>% 
+  distinct(address, GEOID)
+
+#provider inforamation
+provider_info_2017 <- 
+  read_tsv(provider_info_2017_data)
+
+#read in shape files
+county_w_medicare_eligible <- st_read(county_w_medicare_eligible_data)
+
+#hospital acquired infections data
+hai <- read_csv(hai_data)
+
+#public health covariates
+public_health_cov <- read_csv(public_health_data)
+```
+
+
+
+Select the relevant variables from the Medicare Part D file
+
+
+```{r}
+npi_antibiotics_total <-
+  provider_info_2017 %>% 
+  transmute(npi, specialty_description, antibiotic_claim_count, antibiotic_bene_count, bene_count, year = 2017)
+```
+
+
+Table 1
+
+```{r}
+special_table_tots_meds_means <- 
+  npi_antibiotics_total %>% 
+  filter(year == 2017) %>% 
+  mutate(
+    specialty_description = 
+      if_else(specialty_description == "Student in an Organized Health Care Education/Training Program", "Student", specialty_description)
+  ) %>% 
+  filter(specialty_description != "Student") %>% 
+  group_by(specialty_description) %>% 
+  summarise(
+    total_anti_bene = sum(antibiotic_bene_count, na.rm = TRUE),
+    total_bene = sum(bene_count, na.rm = TRUE),
+    total_anti_claims = sum(antibiotic_claim_count, na.rm = TRUE),
+    mean_anti_claims = mean(antibiotic_claim_count, na.rm = TRUE),
+    median_anti_claims = median(antibiotic_claim_count, na.rm = TRUE),
+    median_bene = median(antibiotic_bene_count, na.rm = TRUE),
+    mean_bene = mean(bene_count, na.rm = TRUE),
+    median_bene = median(bene_count, na.rm = TRUE),
+    median_anti_per_bene = 
+      median(antibiotic_claim_count, na.rm = TRUE) / median(bene_count, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    mean_anti_per_total_bene = total_anti_claims / total_bene,
+    percent_antibene_of_total = total_anti_bene / total_bene,
+    percent_antibene_of_total = scales:::percent(percent_antibene_of_total),
+    median_anti_per_bene = scales:::percent(median_anti_per_bene),
+    mean_anti_per_total_bene = scales:::percent(mean_anti_per_total_bene)
+  ) %>% 
+  top_n(30,  total_anti_bene) %>% 
+  arrange(desc( total_anti_bene)) %>%
+  select(
+    `Specialty` = specialty_description,
+    `Total Anti Bene` = total_anti_bene, 
+    `Total Anti Bene/Total Bene` = percent_antibene_of_total,
+    `Total Anti Claims` = total_anti_claims,
+    `Mean Anti Claims` = mean_anti_claims,
+    `Median Anti Claims` = median_anti_claims,
+    `Mean Anti Claims Per Bene` = mean_anti_per_total_bene,
+    `Median Anti Claims Per Bene` = median_anti_per_bene
+  )
+
+special_table_tots_meds_means %>% 
+  write_csv("~/Downloads/table_1_special_table_tots_meds_means.csv")
+```
+
+
+
+Top 30 antibiiotic prescribing specialties (in terms of their beneficaries)
+
+```{r}
+top_30_anti_specialties <- 
+  npi_antibiotics_total %>% 
+  filter(
+    year == 2017
+  ) %>% 
+  mutate(
+    specialty_description = 
+      if_else(specialty_description == "Student in an Organized Health Care Education/Training Program", "Student", specialty_description)
+  ) %>% 
+  filter(specialty_description != "Student") %>%
+  group_by(specialty_description) %>% 
+  summarise(
+    total_anti_bene = sum(antibiotic_bene_count, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  top_n(30,  total_anti_bene) %>% 
+  pull(specialty_description)
+```
+
+
+Begin building table 2 - calculate the cumulative prescribing of the top 1, 5, 10, 20, 50 percent of prescribers for each specialty
+
+```{r}
+total_internal_2017 <- 
+  npi_antibiotics_total %>% 
+  filter(
+    year == 2017
+  ) %>% 
+  group_by(specialty_description) %>% 
+  summarise(total = sum(antibiotic_claim_count, na.rm = TRUE)) %>% 
+  ungroup() 
+
+anti_top_percent_tables <- 
+  npi_antibiotics_total %>%
+  mutate(
+    specialty_description = 
+      if_else(specialty_description == "Student in an Organized Health Care Education/Training Program", "Student", specialty_description)
+  ) %>% 
+  filter(
+    year == 2017,
+    specialty_description %in% top_30_anti_specialties
+  ) %>% 
+  drop_na(antibiotic_claim_count) %>% 
+  left_join(total_internal_2017, by = "specialty_description") %>% 
+  group_by(specialty_description) %>% 
+  arrange(desc(antibiotic_claim_count)) %>% 
+  mutate(
+    prcnt_rank = round(percent_rank(antibiotic_claim_count), 2),
+    cum_value = cumsum(antibiotic_claim_count) / total 
+  ) %>% 
+  ungroup() %>%
+  group_by(specialty_description, prcnt_rank) %>% 
+  top_n(1, cum_value) %>% 
+  ungroup() %>% 
+  filter(prcnt_rank %in% c(1.00, 0.96, 0.91, 0.81, 0.51, .50, .49, .52)) %>% 
+  mutate(top_percent = 1 - prcnt_rank + 0.01) %>% 
+  select(specialty_description, top_percent, cum_value) %>% 
+  spread(top_percent, cum_value) %>% 
+  mutate(
+    `0.5` = if_else(!is.na(`0.5`), `0.5`, if_else(!is.na(`0.51`), `0.51`, if_else(!is.na(`0.49`), `0.49`, `0.52`)))
+  ) %>% 
+  mutate_at(vars(`0.01`, `0.05`, `0.1`, `0.2`, `0.5`), ~scales:::percent(.)) %>% 
+  select(
+    `Specialty Description` = specialty_description,
+    `Top 1 Percent` = `0.01`,
+    `Top 5 Percent` = `0.05`,
+    `Top 10 Percent` = `0.1`,
+    `Top 20 Percent` = `0.2`,
+    `Top 50 Percent` = `0.5`
+  )
+
+```
+
+
+Build Table 2 - combinie and sort by Gini coefficient
+
+
+```{r}
+# compute Gini coefficient
+special_gin_coefs <- 
+  npi_antibiotics_total %>%
+  mutate(
+    specialty_description = 
+      if_else(specialty_description == "Student in an Organized Health Care Education/Training Program", "Student", specialty_description)
+  ) %>% 
+  filter(
+    year == 2017,
+    specialty_description %in% top_30_anti_specialties
+  ) %>% 
+  drop_na(antibiotic_claim_count) %>% 
+  left_join(total_internal_2017, by = "specialty_description") %>% 
+  group_by(specialty_description) %>% 
+  summarise(
+    gini_coef = Gini(antibiotic_claim_count)
+  ) %>% 
+  ungroup() %>% 
+  mutate(gini_coef = scales:::percent(gini_coef))
+
+table_inequality <- 
+  anti_top_percent_tables %>% 
+  left_join(special_gin_coefs, by = c("Specialty Description" = "specialty_description"))
+
+table_inequality %>% 
+  select(
+    `Specialty Description`, gini_coef, `Top 1 Percent`, 
+    `Top 5 Percent`, `Top 10 Percent`, `Top 20 Percent`
+  ) %>% 
+  arrange(desc(gini_coef)) %>% 
+  write_csv("~/Downloads/table_2_inequality.csv")
+```
+
+
+
+Build a dataset that includes the county mapping of prescribers (merge on address- google api was used to get county's of addresses)
+
+```{r}
+antibiotics_with_county <- 
+  npi_antibiotics_total %>% 
+  left_join(
+    provider_info_2017 %>% 
+    transmute(npi, nppes_provider_street1, nppes_provider_city, nppes_provider_state, year = 2017) %>% 
+    mutate(address = str_c(nppes_provider_street1, ", ", nppes_provider_city, ", ", nppes_provider_state)) %>% 
+    select(npi, address, year),
+    by = c("npi", "year")
+  ) %>% 
+  left_join(
+    address_county_mapping,
+    by = "address"
+  )
+```
+
+
+County geometries were extracted from tidycensus (county_w_medicare_eligible file)
+
+
+```{r}
+medicare_part_d_2017 <- 
+  county_w_medicare_eligible %>% 
+  left_join(
+    medicare_part_d %>% 
+    select(State, County, medicare_pop = `2017`) %>% 
+    mutate(NAME = str_c(County, " County, ", State)),
+    by = "NAME"
+  ) 
+
+```
+
+
+Merge antibiotic claims information and county data, calculate the total claims per medicare enrollee per county
+
+```{r}
+US_ALBERS <- 
+  "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=37.5 +lon_0=-96 +x_0=0 +y_0=0 +datum=WGS84 +no_defs"
+
+anti_map_data <- 
+  antibiotics_with_county %>% 
+  filter(year == 2017) %>% 
+  group_by(GEOID) %>% 
+  summarise(
+    total_claims = sum(antibiotic_claim_count, na.rm = TRUE),
+    total_anti_bene = sum(antibiotic_bene_count, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  left_join(
+    medicare_part_d_2017,
+    by = "GEOID"
+  ) %>% 
+  filter(total_claims > 0) %>% 
+  mutate(claims_per_enrollee = total_claims / medicare_pop) 
+```
+
+
+
+Make Figure 1
+
+```{r, fig.width = 5, fig.height = 5}
+st_crs(anti_map_data$geometry) <- 4326 
+
+theme_set(theme_minimal())
+
+font <- "Roboto"
+
+my_theme <- function() {
+  ggplot2::theme(
+    text = element_text(family = font),
+    plot.title = element_text(family = font, size = 18, face = "bold", color = "#222222"),
+    plot.subtitle = element_text(family = font, size = 12),
+    plot.caption = element_text(family = font)
+  )
+}
+
+anti_map_data %>% 
+  separate(GEOID, into = c("state_fips", "county_fips"), sep = -3, convert = FALSE, remove = FALSE) %>% 
+  filter(!state_fips %in% c(c("02", "15", "72"))) %>% 
+  filter(!is.na(claims_per_enrollee)) %>% 
+  filter(claims_per_enrollee < 7) %>% 
+  st_as_sf() %>% 
+  st_transform(crs = US_ALBERS) %>% 
+  mutate(counts_cut_number = cut_number(claims_per_enrollee, n = 5)) %>% 
+  ggplot() +
+  geom_sf(aes(fill = counts_cut_number), size = 0.05) +
+  coord_sf(datum = NA) +
+  scale_fill_viridis_d(
+      name = "Medicare Part D\nAntibiotic Claims\nper Enrollee",
+      na.value = "white",
+      option = "plasma",
+      direction = 1
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = .5),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size=8)
+  ) +
+  labs(
+    title = "Antibiotic Prescribing Rates by County",
+    caption = "Source: 2017 Medicare Part D"
+  )
+```
+
+
+Buid the HAI dataset: tootal HAIs for each measure at the county level
+
+```{r}
+state <- 
+  read_csv(state_data, col_names = FALSE) %>% 
+  select(abr = X3, State_full = X2)
+
+hai_vars <- 
+  hai %>% 
+  left_join(
+    state,
+    by = c("State" = "abr")
+  ) %>%
+  mutate(
+    county_title = str_to_lower(`County Name`) %>% str_to_title(),
+    NAME = str_c(county_title, " County, ", State_full)
+  ) %>% 
+  filter(Score != "Not Available") %>% 
+  mutate(Score = as.double(Score)) %>% 
+  group_by(NAME, `Measure Name`) %>% 
+  summarise(
+    mean_score = mean(Score, na.rm = TRUE),
+    median_score = median(Score, na.rm = TRUE),
+    total_score = sum(Score, na.rm = TRUE)
+  ) %>% 
+  ungroup()
+```
+
+
+Pearson correlation between a counties C.Diff Patient Days and total antibiotic claims 
+
+```{r}
+hai_data_tmp <- 
+  hai_vars %>%
+  filter(`Measure Name` == "Clostridium Difficile (C.Diff): Patient Days") %>% 
+  left_join(
+    anti_map_data %>% 
+    select(GEOID, total_claims, NAME),
+    by = "NAME"
+  ) %>% 
+  filter(!is.na(total_score), !is.na(total_claims))
+
+cor.test(hai_data_tmp$total_score, hai_data_tmp$total_claims, method = c("pearson"))
+```
+
+Pearson correlation between a counties C.Diff Observed cases and total antibiotic claims 
+
+```{r}
+hai_data_tmp <- 
+  hai_vars %>%
+  filter(`Measure Name` == "Clostridium Difficile (C.Diff): Observed Cases") %>% 
+  left_join(
+    anti_map_data %>% 
+    select(GEOID, total_claims,  total_anti_bene,  NAME),
+    by = "NAME"
+  ) %>% 
+  filter(!is.na(total_score), !is.na(total_claims))
+
+cor.test(hai_data_tmp$total_score, hai_data_tmp$total_claims, method = c("pearson"))
+```
+
+
+Pearson correlation between a counties MRSA Bacteremia Observed cases and total antibiotic claims 
+
+```{r}
+hai_data_tmp <- 
+  hai_vars %>%
+  filter(`Measure Name` == "MRSA Bacteremia: Observed Cases")%>% 
+  left_join(
+    anti_map_data %>% 
+    select(GEOID, total_claims, NAME),
+    by = "NAME"
+  ) %>% 
+  filter(!is.na(total_score), !is.na(total_claims))
+
+cor.test(hai_data_tmp$total_score, hai_data_tmp$total_claims, method = c("pearson"))
+```
+
+Pearson correlation between a counties MRSA Bacteremia Patient Days and total antibiotic claims 
+
+```{r}
+hai_data_tmp <- 
+  hai_vars %>%
+  filter(`Measure Name` == "MRSA Bacteremia: Patient Days") %>% 
+  left_join(
+    anti_map_data %>% 
+    select(GEOID, total_claims, NAME),
+    by = "NAME"
+  ) %>% 
+  filter(!is.na(total_score), !is.na(total_claims))
+
+cor.test(hai_data_tmp$total_score, hai_data_tmp$total_claims, method = c("pearson"))
+```
+
+
+Prepare our data for predictive modelling
+
+Combine our antibiotic prescribing information, with the HAI data and a variety of public health covariates 
+
+```{r}
+data_hai_anti_disease_together <- 
+  hai_vars %>%
+  select(NAME, `Measure Name`, total_score) %>% 
+  spread(`Measure Name`, total_score) %>% 
+  left_join(
+    anti_map_data %>% 
+    select(GEOID, total_claims, NAME, total_anti_bene) %>% 
+      mutate(GEOID = as.numeric(GEOID) %>% as.character()),
+    by = "NAME"
+  ) %>% 
+  left_join(
+    public_health_cov %>% 
+      mutate(FIPS = as.character(FIPS)),
+    by = c("GEOID" = "FIPS")
+  ) %>% 
+  left_join(
+    medicare_part_d_2017 %>% 
+      select(GEOID, medicare_pop) %>% 
+      as.data.frame() %>% 
+      select(-geometry),
+    by = c("GEOID")
+  ) %>% 
+  mutate(
+    claims_per_enrollee = total_claims / medicare_pop,
+    percent_bene = total_anti_bene / medicare_pop
+  ) %>% 
+  mutate(
+    CAULI_rate_obs = 100000 *`Catheter Associated Urinary Tract Infections (ICU + select Wards): Observed Cases` / Population,
+    CDIFF_rate_obs = 100000 *`Clostridium Difficile (C.Diff): Observed Cases` / Population,
+    MRSA_rate_obs = 100000 *`MRSA Bacteremia: Observed Cases` / Population,
+    SSI_colon_rate_obs = 100000 *`SSI - Colon Surgery: Observed Cases` / Population,
+    CLABI_rate_obs = 100000 *`Central Line Associated Bloodstream Infection (ICU + select Wards): Observed Cases` / Population
+  ) %>% 
+  mutate(
+    CDIFF_rate_patients = 100000 * `Clostridium Difficile (C.Diff): Patient Days` / Population,
+    MRSA_rate_patients = 100000 * `MRSA Bacteremia: Patient Days` / Population
+  )
+```
+
+
+
+Covariates that we include for predicting totals (not rates) for several HAI outcomes
+
+```{r}
+model_covariates <- 
+  c("total_claims", "total_anti_bene", "Population", "diabetes_crude", "obesity_crude", "physical_inactivity_crude",
+    "% Fair/Poor", "% Smokers", "% With Access", "PCP Rate", "Preventable Hosp. Rate",
+    "% Some College", "% Children in Poverty", "Graduation Rate", "% Severe Housing Problems",
+    "Age-Adjusted Mortality", "Life Expectancy", "% Frequent Physical Distress", "% Food Insecure",
+    "% Insufficient Sleep", "Household Income", "% Homeowners", "% 65 and over", "% Rural")
+
+model_covaraites_no_antibiotics <- 
+  c("diabetes_crude", "obesity_crude", "Population", "physical_inactivity_crude", 
+    "% Fair/Poor", "% Smokers", "% With Access", "PCP Rate", "Preventable Hosp. Rate",
+    "% Some College", "% Children in Poverty", "Graduation Rate", "% Severe Housing Problems",
+    "Age-Adjusted Mortality", "Life Expectancy", "% Frequent Physical Distress", "% Food Insecure",
+    "% Insufficient Sleep", "Household Income", "% Homeowners", "% 65 and over", "% Rural")
+```
+
+
+Covariates that we include for predicting rates for several HAI outcomes
+
+```{r}
+model_covariates_rates <- 
+  c("claims_per_enrollee", "percent_bene", "Population", "diabetes_crude", "obesity_crude", "physical_inactivity_crude",
+    "% Fair/Poor", "% Smokers", "% With Access", "PCP Rate", "Preventable Hosp. Rate",
+    "% Some College", "% Children in Poverty", "Graduation Rate", "% Severe Housing Problems",
+    "Age-Adjusted Mortality", "Life Expectancy", "% Frequent Physical Distress", "% Food Insecure",
+    "% Insufficient Sleep", "Household Income", "% Homeowners", "% 65 and over", "% Rural")
+
+model_covaraites_no_antibiotics_rates <- 
+  c("diabetes_crude", "obesity_crude", "Population", "physical_inactivity_crude", 
+    "% Fair/Poor", "% Smokers", "% With Access", "PCP Rate", "Preventable Hosp. Rate",
+    "% Some College", "% Children in Poverty", "Graduation Rate", "% Severe Housing Problems",
+    "Age-Adjusted Mortality", "Life Expectancy", "% Frequent Physical Distress", "% Food Insecure",
+    "% Insufficient Sleep", "Household Income", "% Homeowners", "% 65 and over", "% Rural")
+```
+
+
+Elastic net model
+
+```{r}
+elastic_net_test <- function(covariates_to_use, hai_outcome){
+  
+  rand_seed <- sample(1:10000, 1)
+  set.seed(rand_seed)
+  
+  cases <-
+    data_hai_anti_disease_together %>%
+    select(covariates_to_use, hai_outcome) %>%
+    filter(!is.na(hai_outcome)) %>%
+    drop_na(hai_outcome) %>% 
+    rename("infection" = hai_outcome)
+  
+  #split into tain and test datasets (80% train)
+  split <- initial_split(cases, props = 8/10)
+  car_train <- training(split)
+  car_test  <- testing(split)
+  
+  #preporcess the predictors
+  car_rec <- 
+    recipe(infection ~ ., data = car_train) %>%
+    step_center(all_predictors()) %>%
+    step_scale(all_predictors()) %>%
+    step_corr(all_predictors()) %>% 
+    prep(training = car_train, retain = TRUE)
+  
+  # The processed versions are:
+  train_data <- juice(car_rec)
+  test_data  <- bake(car_rec, car_test)
+  
+  #Elastic net regression with penalty of .01 #, mixture = varying() , , alpha = .5
+  glmn_fit <- 
+    linear_reg(penalty = .1, mixture = .5) %>% 
+    set_engine("glmnet") %>%
+    fit(infection ~ ., data = train_data)
+  
+  #Apply model to test data
+  test_results <- 
+    test_data %>% 
+    select(infection) %>% 
+    bind_cols(predict(glmn_fit, test_data)) %>% 
+    filter(!is.na(.pred)) %>% 
+    mutate(.pred = if_else(.pred < 0, 0, .pred))
+  
+  #Output test data
+  test_results %>% 
+    metrics(truth = infection, estimate = .pred) %>% 
+    filter(.metric == "rsq") %>% 
+    pull(.estimate)
+}
+
+
+boot_samp <- function(covariates_to_use, hai_outcome){
+  boot <- map(seq_len(100), ~elastic_net_test(covariates_to_use, hai_outcome)) %>% unlist()
+  mean_boot <- boot %>% mean()
+  sd_boot <- boot %>% sd()
+  mean_sd_boot <- c(mean_boot, sd_boot)
+  return(mean_sd_boot)
+}
+```
+
+
+#Elastic net models using all covariates, and without antibiotic variables, predicting volumes
+
+Elastic net performance: "Clostridium Difficile (C.Diff)" 
+
+```{r, warning=FALSE}
+boot_samp(model_covariates, "Clostridium Difficile (C.Diff): Patient Days")
+boot_samp(model_covariates, "Clostridium Difficile (C.Diff): Observed Cases")
+
+#no antibiotics
+boot_samp(model_covaraites_no_antibiotics, "Clostridium Difficile (C.Diff): Patient Days")
+boot_samp(model_covaraites_no_antibiotics, "Clostridium Difficile (C.Diff): Observed Cases")
+```
+
+Elastic net performance: "MRSA Bacteremia"
+
+```{r, warning=FALSE}
+boot_samp(model_covariates, "MRSA Bacteremia: Patient Days")
+boot_samp(model_covariates, "MRSA Bacteremia: Observed Cases")
+
+#no antibiotics
+boot_samp(model_covaraites_no_antibiotics, "MRSA Bacteremia: Patient Days")
+boot_samp(model_covaraites_no_antibiotics, "MRSA Bacteremia: Observed Cases")
+```
+
+
+Elastic net performance: Observed cases for other HAIs
+
+```{r, warning=FALSE}
+boot_samp(model_covariates, "SSI - Colon Surgery: Observed Cases")
+boot_samp(model_covariates, "Central Line Associated Bloodstream Infection (ICU + select Wards): Observed Cases")
+boot_samp(model_covariates, "Catheter Associated Urinary Tract Infections (ICU + select Wards): Observed Cases")
+
+#no antibiotics
+boot_samp(model_covaraites_no_antibiotics, "SSI - Colon Surgery: Observed Cases")
+boot_samp(model_covaraites_no_antibiotics, "Central Line Associated Bloodstream Infection (ICU + select Wards): Observed Cases")
+boot_samp(model_covaraites_no_antibiotics, "Catheter Associated Urinary Tract Infections (ICU + select Wards): Observed Cases")
+```
+
+
+
+#Elastic net predict rates
+
+Rates: Elastic net performance: "Clostridium Difficile (C.Diff)" 
+
+```{r, warning=FALSE}
+boot_samp(model_covariates_rates, "CDIFF_rate_patients")
+boot_samp(model_covariates_rates, "CDIFF_rate_obs")
+
+#no antibiotics
+boot_samp(model_covaraites_no_antibiotics_rates, "CDIFF_rate_patients")
+boot_samp(model_covaraites_no_antibiotics_rates, "CDIFF_rate_obs")
+```
+
+Rates: Elastic net performance: "MRSA Bacteremia"
+
+```{r, warning=FALSE}
+boot_samp(model_covariates_rates, "MRSA_rate_patients")
+boot_samp(model_covariates_rates, "MRSA_rate_obs")
+
+#no antibiotics
+boot_samp(model_covaraites_no_antibiotics_rates, "MRSA_rate_patients")
+boot_samp(model_covaraites_no_antibiotics_rates, "MRSA_rate_obs")
+```
+
+
+
+#Random forest model
+
+We use the same covariates as before, except we need to reformat the names
+
+```{r}
+data_hai_anti_disease_together_rf <- 
+  data_hai_anti_disease_together %>% 
+  rename(
+    percent_fair_poor = `% Fair/Poor`,
+    percent_smokers = `% Smokers`,
+    percent_access = `% With Access`,
+    percent_college = `% Some College`,
+    pcp_rate = `PCP Rate`,
+    preventable_hosp_rate = `Preventable Hosp. Rate`,
+    percent_poverty = `% Children in Poverty`,
+    graduation_rate = `Graduation Rate`,
+    percent_housing_problems = `% Severe Housing Problems`,
+    age_adjusted_mortality = `Age-Adjusted Mortality`,
+    life_expectancy = `Life Expectancy`, 
+    percent_frequent_distress = `% Frequent Physical Distress`,
+    percent_food_insecure = `% Food Insecure`,
+    percent_insufficient_sleep = `% Insufficient Sleep`,
+    household_income = `Household Income`,
+    percent_homeowners = `% Homeowners`,
+    percent_65_over = `% 65 and over`,
+    percent_rural = `% Rural`
+  )
+
+
+model_covariates_rf <- 
+  c("total_claims", "total_anti_bene", "Population", "diabetes_crude", "obesity_crude", "physical_inactivity_crude",
+    "percent_fair_poor", "percent_smokers", "percent_access", "pcp_rate", "preventable_hosp_rate",
+    "percent_college", "percent_poverty", "graduation_rate", "percent_housing_problems",
+    "age_adjusted_mortality", "life_expectancy", "percent_frequent_distress", "percent_food_insecure",
+    "percent_insufficient_sleep", "household_income", "percent_homeowners", "percent_65_over", "percent_rural")
+
+model_covaraites_no_antibiotics_rf <- 
+  c("Population", "diabetes_crude", "obesity_crude", "physical_inactivity_crude",
+    "percent_fair_poor", "percent_smokers", "percent_access", "pcp_rate", "preventable_hosp_rate",
+    "percent_college", "percent_poverty", "graduation_rate", "percent_housing_problems",
+    "age_adjusted_mortality", "life_expectancy", "percent_frequent_distress", "percent_food_insecure",
+    "percent_insufficient_sleep", "household_income", "percent_homeowners", "percent_65_over", "percent_rural")
+
+
+#Covariates that we include for predicting rates for several HAI outcomes
+model_covariates_rates_rf <- 
+  c("claims_per_enrollee", "percent_bene", "Population", "diabetes_crude", "obesity_crude", "physical_inactivity_crude",
+    "percent_fair_poor", "percent_smokers", "percent_access", "pcp_rate", "preventable_hosp_rate",
+    "percent_college", "percent_poverty", "graduation_rate", "percent_housing_problems",
+    "age_adjusted_mortality", "life_expectancy", "percent_frequent_distress", "percent_food_insecure",
+    "percent_insufficient_sleep", "household_income", "percent_homeowners", "percent_65_over", "percent_rural")
+
+model_covaraites_no_antibiotics_rates_rf <- 
+  c( "Population", "diabetes_crude", "obesity_crude", "physical_inactivity_crude",
+    "percent_fair_poor", "percent_smokers", "percent_access", "pcp_rate", "preventable_hosp_rate",
+    "percent_college", "percent_poverty", "graduation_rate", "percent_housing_problems",
+    "age_adjusted_mortality", "life_expectancy", "percent_frequent_distress", "percent_food_insecure",
+    "percent_insufficient_sleep", "household_income", "percent_homeowners", "percent_65_over", "percent_rural")
+```
+
+
+Random forest model function
+
+```{r}
+random_forest_test <- function(covariates_to_use, hai_outcome){
+  
+  rand_seed <- sample(1:10000, 1)
+  set.seed(rand_seed)
+  
+  cases <-
+    data_hai_anti_disease_together_rf %>%
+    select(covariates_to_use, hai_outcome) %>%
+    filter(complete.cases(.)) %>%
+    rename("infection" = hai_outcome)
+  
+  #split into tain and test datasets (80% train)
+  split <- initial_split(cases, props = 8/10)
+  car_train <- training(split)
+  car_test  <- testing(split)
+  
+  #no scaling
+  car_rec <- 
+    recipe(infection ~ ., data = car_train) %>%
+    prep(training = car_train, retain = TRUE)
+  
+  # The processed versions are:
+  train_data <- juice(car_rec)
+  test_data  <- bake(car_rec, car_test)
+  
+  #Elastic net regression with penalty of .01
+  rf_fit1 <- 
+    rand_forest(mode = "regression") %>% 
+    set_engine("randomForest", importance=T) %>%
+    fit(infection ~ ., data = train_data)
+
+  rf_fit_importaance <- 
+    rf_fit1$fit$importance %>% 
+    as_tibble() %>% 
+    cbind(variable = row.names(rf_fit1$fit$importance)) %>% 
+    mutate(variable = fct_reorder(variable, `%IncMSE`)) %>% 
+    select(variable, `%IncMSE`)
+
+  test_results <- 
+    test_data %>% 
+    select(infection) %>% 
+    bind_cols(predict(rf_fit1, test_data)) %>% 
+    filter(!is.na(.pred)) %>% 
+    mutate(.pred = if_else(.pred < 0, 0, .pred)) %>% 
+    metrics(truth = infection, estimate = .pred) %>% 
+    filter(.metric == "rsq") %>% 
+    pull(.estimate)
+  
+  rf_list <- list("rf_fit" = rf_fit_importaance, "test_results" = test_results)
+                  
+  return(rf_list)
+}
+
+
+boot_samp_rf <- function(covariates_to_use, hai_outcome){
+  boot <- map(seq_len(100), ~random_forest_test(covariates_to_use, hai_outcome)$test_results) %>% unlist()
+  mean_boot <- boot %>% mean()
+  sd_boot <- boot %>% sd()
+  mean_sd_boot <- c(mean_boot, sd_boot)
+  return(mean_sd_boot)
+}
+
+```
+
+
+
+RF CDIFF
+
+```{r}
+boot_samp_rf(model_covariates_rf, "Clostridium Difficile (C.Diff): Patient Days")
+boot_samp_rf(model_covariates_rf, "Clostridium Difficile (C.Diff): Observed Cases")
+
+boot_samp_rf(model_covaraites_no_antibiotics_rf, "Clostridium Difficile (C.Diff): Patient Days")
+boot_samp_rf(model_covaraites_no_antibiotics_rf, "Clostridium Difficile (C.Diff): Observed Cases")
+```
+
+
+RF MRSA
+
+```{r}
+boot_samp_rf(model_covariates_rf, "MRSA Bacteremia: Patient Days")
+boot_samp_rf(model_covariates_rf, "MRSA Bacteremia: Observed Cases")
+
+boot_samp_rf(model_covaraites_no_antibiotics_rf, "MRSA Bacteremia: Patient Days")
+boot_samp_rf(model_covaraites_no_antibiotics_rf, "MRSA Bacteremia: Observed Cases")
+```
+
+RF CDIFF rates
+
+```{r}
+boot_samp_rf(model_covariates_rates_rf, "CDIFF_rate_patients")
+boot_samp_rf(model_covariates_rates_rf, "CDIFF_rate_obs")
+
+#no antibiotics
+boot_samp_rf(model_covaraites_no_antibiotics_rates_rf, "CDIFF_rate_patients")
+boot_samp_rf(model_covaraites_no_antibiotics_rates_rf, "CDIFF_rate_obs")
+```
+
+
+RF MRSA rates
+
+```{r}
+boot_samp_rf(model_covariates_rates_rf, "MRSA_rate_patients")
+boot_samp_rf(model_covariates_rates_rf, "CDIFF_rate_obs")
+
+#no antibiotics
+boot_samp_rf(model_covaraites_no_antibiotics_rates_rf, "MRSA_rate_patients")
+boot_samp_rf(model_covariates_rates_rf, "CDIFF_rate_obs")
+```
+
+
+Facet Plot of variable importance
+
+```{r, fig.width=6}
+rf_cdiff_patient <- random_forest_test(model_covariates_rf, "Clostridium Difficile (C.Diff): Patient Days")
+rf_cdiff_cases <- random_forest_test(model_covariates_rf, "Clostridium Difficile (C.Diff): Observed Cases")
+rf_mrsa_patient <- random_forest_test(model_covariates_rf, "MRSA Bacteremia: Patient Days")
+rf_mrsa_cases <- random_forest_test(model_covariates_rf, "MRSA Bacteremia: Observed Cases")
+
+
+rf_cdiff_cases$rf_fit %>% 
+  mutate(outcome = "CDIFF Observed Cases") %>% 
+  rbind(
+    rf_cdiff_patient$rf_fit %>% 
+    mutate(outcome = "CDIFF Patient Days")
+  ) %>% 
+  rbind(
+    rf_mrsa_cases$rf_fit %>% 
+    mutate(outcome = "MRSA Observed Cases")
+  ) %>% 
+  rbind(
+    rf_mrsa_patient$rf_fit %>% 
+    mutate(outcome = "MRSA Patient Days")
+  ) %>% 
+  ggplot(aes(variable, `%IncMSE`)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  theme(axis.text.x = element_blank()) +
+  facet_grid(~ outcome, scales = "free_x")
+```
+
+
+
